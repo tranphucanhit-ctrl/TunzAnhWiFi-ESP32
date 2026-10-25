@@ -1,34 +1,50 @@
 name: Build ESP32 Firmware
 
-on: [push]
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
+        uses: arduino/setup-arduino-cli@v2
 
-      - name: Install ESP32 Core & Libraries
+      - name: Install ESP32 Platform (v3.x)
         run: |
-          arduino-cli config init
-          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli core update-index
-          arduino-cli core install esp32:esp32
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.12 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+      - name: Install Libraries
+        run: |
           arduino-cli lib install "Adafruit GFX Library"
           arduino-cli lib install "Adafruit SSD1306"
+          arduino-cli lib install "Adafruit BusIO"
+
+      - name: Prepare Sketch & Strip UTF-8 BOM
+        run: |
+          mkdir -p sketch_build out
+          
+          # Gộp các file .ino (hoặc copy file duy nhất)
+          cat *.ino > sketch_build/sketch_build.ino 2>/dev/null || cp *.ino sketch_build/sketch_build.ino
+          
+          # Xoá ký tự Byte Order Mark (BOM) ở dòng đầu tiên gây lỗi compiler
+          sed -i '1s/^\xEF\xBB\xBF//' sketch_build/sketch_build.ino
 
       - name: Compile Sketch
         run: |
-          mkdir -p sketch_build out
-          cp *.ino sketch_build/sketch_build.ino 2>/dev/null || true
-          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir out sketch_build/sketch_build.ino
+          arduino-cli compile --fqbn esp32:esp32:esp32 sketch_build/sketch_build.ino --output-dir out/
 
-      - name: Upload Binary Artifact
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ESP32_Firmware
-          path: out/*.bin
+          name: ESP32-Firmware
+          path: out/
