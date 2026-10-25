@@ -23,8 +23,9 @@ jobs:
 
       - name: Compile Sketch
         run: |
-          mkdir -p out
-          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir out *.ino
+          mkdir -p sketch_build out
+          cp *.ino sketch_build/sketch_build.ino 2>/dev/null || true
+          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir out sketch_build/sketch_build.ino
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
