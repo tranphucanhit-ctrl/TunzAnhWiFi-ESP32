@@ -14,12 +14,9 @@
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// --- NÚT ENTER SƠ ĐỒ NRFBOX ---
-#define BTN_ENTER_PIN 34 // Đổi thành GPIO tương ứng trên sơ đồ NRFBox của bạn (vd: 0, 34, 35, 13)
-
 const int LED_PIN = 2;
 
-String ap_ssid = "TunzAnhESP32_Setup";
+String ap_ssid = "TunzAnhESP32_KichSong";
 String ap_pass = "12345678";
 String sta_ssid = "";
 String sta_pass = "";
@@ -36,8 +33,6 @@ bool proxy_enabled = false;
 IPAddress ap_ip(172, 20, 10, 1);
 IPAddress ap_gateway(172, 20, 10, 1);
 IPAddress ap_mask(255, 255, 255, 0);
-IPAddress ap_leaseStart(172, 20, 10, 2);
-IPAddress ap_dns(8, 8, 8, 8);
 
 WebServer server(80);
 WiFiServer proxyServer(8080);
@@ -46,25 +41,22 @@ Preferences preferences;
 
 bool oledOK = false;
 bool botStarted = false;
-bool showQRMode = false;
+
+volatile bool wifiConnectedEvent = false;
+volatile bool wifiDisconnectedEvent = false;
 
 unsigned long lastCronTime = 0;
 const unsigned long CRON_INTERVAL = 1800000;
+
 unsigned long lastWifiCheckTime = 0;
 const unsigned long WIFI_CHECK_INTERVAL = 5000;
 
-// QR Code Zalo (0378389615) - Pixel Matrix 29x29
-const uint8_t zalo_qr_bits[] PROGMEM = {
-  0xff,0xff,0xff,0xf8,0x80,0x02,0x00,0x88,0xbd,0xbf,0x6d,0x88,0xbd,0xbf,0x6d,0x88,
-  0xbd,0xbf,0x6d,0x88,0x80,0x02,0x00,0x88,0xff,0xff,0xff,0xf8,0x00,0x00,0x00,0x00,
-  0xe3,0x8e,0x38,0xe8,0x1c,0xe3,0x8e,0x08,0x63,0x1c,0xe3,0x88,0x8e,0x38,0x1c,0xe8,
-  0x38,0xe3,0x8e,0x08,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xf8,0x80,0x02,0x00,0x88,
-  0xbd,0xbf,0x6d,0x88,0xbd,0xbf,0x6d,0x88,0xbd,0xbf,0x6d,0x88,0x80,0x02,0x00,0x88,
-  0xff,0xff,0xff,0xf8
-};
+// Bộ đếm thời gian cập nhật OLED liên tục
+unsigned long lastOLEDRefreshTime = 0;
+const unsigned long OLED_REFRESH_INTERVAL = 1000; // Cập nhật mỗi 1 giây (1000ms)
 
 void displayMsg(String line1, String line2 = "", String line3 = "", String line4 = "") {
-  if (!oledOK || showQRMode) return;
+  if (!oledOK) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -75,21 +67,38 @@ void displayMsg(String line1, String line2 = "", String line3 = "", String line4
   display.display();
 }
 
-void drawZaloQR() {
+// Hàm render UI OLED thời gian thực
+void updateRealtimeOLED() {
   if (!oledOK) return;
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+
+  // Header
   display.setCursor(0, 0);
-  display.println(F("  ZALO DEV SCAN QR"));
-  
-  // Vẽ QR ở giữa màn hình
-  display.drawBitmap(49, 14, zalo_qr_bits, 29, 29, SSD1306_WHITE);
-  
-  display.setCursor(0, 48);
-  display.println(F("Zalo: 0378389615"));
-  display.setCursor(0, 56);
+  display.println(F("TunzAnhESP32 KichSong"));
+
+  // IP / Status
+  display.setCursor(0, 14);
+  if (WiFi.status() == WL_CONNECTED) {
+    display.println("IP:" + WiFi.localIP().toString());
+  } else {
+    display.println(F("IP: Disconnected"));
+  }
+
+  // AP / Mode
+  display.setCursor(0, 28);
+  display.println(F("AP:172.20.10.1 (NAPT)"));
+
+  // Thông số RAM + Thời gian chạy Uptime (giây)
+  display.setCursor(0, 42);
+  display.println("RAM:" + String(ESP.getFreeHeap() / 1024) + "KB | " + String(millis() / 1000) + "s");
+
+  // Footer Developer
+  display.setCursor(0, 54);
   display.println(F("Dev: Tunz Anh Dev"));
+
   display.display();
 }
 
@@ -99,13 +108,11 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       ip_napt_enable(ipaddr_addr("172.20.10.1"), 1);
-      digitalWrite(LED_PIN, HIGH);
-      displayMsg("SETUP AP MODE", "IP: 172.20.10.1", "Hay ket noi de cai da", "t");
+      wifiConnectedEvent = true;
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       ip_napt_enable(ipaddr_addr("172.20.10.1"), 0);
-      digitalWrite(LED_PIN, LOW);
-      displayMsg("SETUP AP MODE", "IP: 172.20.10.1", "Hay ket noi de cai da", "t");
+      wifiDisconnectedEvent = true;
       break;
     default: break;
   }
@@ -119,114 +126,86 @@ const char admin_html[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TunzAnhESP32 Kích Sóng</title>
   <style>
-    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0b0f19; color: #e2e8f0; margin: 0; padding: 15px; text-align: center; }
-    .container { width: 100%; max-width: 500px; background: #151d30; padding: 20px; border-radius: 16px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.7); border: 1px solid #1e293b; box-sizing: border-box; }
-    h2 { color: #38bdf8; margin: 0 0 5px 0; font-size: 22px; }
-    .dev-badge { background: #0284c7; color: #fff; font-size: 11px; padding: 3px 10px; border-radius: 12px; display: inline-block; margin-bottom: 15px; font-weight: bold; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
-    .stat-box { background: #0b0f19; padding: 12px; border-radius: 10px; border: 1px solid #1e293b; text-align: left; }
-    .stat-title { font-size: 11px; color: #64748b; font-weight: bold; text-transform: uppercase; }
-    .stat-val { font-size: 14px; color: #38bdf8; font-weight: bold; margin-top: 4px; }
-    .card { background: #0b0f19; padding: 16px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #1e293b; text-align: left; }
-    label { display: block; margin-bottom: 4px; font-size: 12px; color: #94a3b8; font-weight: bold; }
-    input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #151d30; color: #fff; box-sizing: border-box; margin-bottom: 10px; font-size: 13px; }
-    .btn { width: 100%; padding: 12px; background: #0284c7; color: #fff; border: none; border-radius: 8px; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; }
-    .btn:hover { background: #0369a1; }
-    .btn-green { background: #16a34a; }
-    .footer { font-size: 12px; color: #64748b; margin-top: 15px; line-height: 1.5; }
-    .footer a { color: #38bdf8; text-decoration: none; font-weight: bold; }
+    body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; text-align: center; }
+    .container { width: 100%; max-width: 480px; background: #1e293b; padding: 24px; border-radius: 16px; margin: 0 auto; box-shadow: 0 10px 25px rgba(0,0,0,0.5); border: 1px solid #334155; }
+    h2 { color: #38bdf8; margin-bottom: 20px; }
+    .card { background: #0f172a; padding: 16px; border-radius: 10px; margin-bottom: 16px; border: 1px solid #334155; text-align: left; }
+    label { display: block; margin-bottom: 6px; font-size: 13px; color: #94a3b8; font-weight: bold; }
+    input[type="file"], input[type="text"], input[type="password"], input[type="number"] { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #fff; box-sizing: border-box; margin-bottom: 10px; }
+    .btn { width: 100%; padding: 12px; background: #38bdf8; color: #0f172a; border: none; border-radius: 8px; font-weight: bold; font-size: 15px; cursor: pointer; margin-top: 5px; }
+    .btn-green { background: #22c55e; color: #fff; }
+    hr { border: 0.5px solid #334155; margin: 15px 0; }
   </style>
 </head>
 <body>
   <div class="container">
     <h2>⚡ TUNZANH ESP32 KÍCH SÓNG</h2>
-    <div class="dev-badge">DEVELOPER EDITION</div>
-
-    <div class="grid">
-      <div class="stat-box"><div class="stat-title">CPU Speed</div><div class="stat-val" id="cpu">240 MHz</div></div>
-      <div class="stat-box"><div class="stat-title">Free RAM</div><div class="stat-val" id="ram">Loading...</div></div>
-      <div class="stat-box"><div class="stat-title">SoftAP IP</div><div class="stat-val">172.20.10.1</div></div>
-      <div class="stat-box"><div class="stat-title">STA Status</div><div class="stat-val" id="sta">Loading...</div></div>
-    </div>
-
     <div class="card">
       <form action="/save-wifi" method="POST">
-        <label>Tên WiFi Nhà (SSID):</label>
+        <label>Tên WiFi nhà (SSID):</label>
         <input type="text" name="ssid" placeholder="Nhập tên WiFi..." required>
-        <label>Mật Khẩu WiFi:</label>
+        <label>Mật khẩu WiFi:</label>
         <input type="password" name="pass" placeholder="Nhập mật khẩu...">
-        <hr style="border: 0.5px solid #1e293b; margin: 12px 0;">
-        <label>Telegram Bot Token:</label>
-        <input type="text" name="token" placeholder="Token Bot Telegram">
-        <label>Telegram Chat ID:</label>
-        <input type="text" name="chatid" placeholder="Chat ID nhận tin nhắn">
-        <button type="submit" class="btn">LƯU CẤU HÌNH & RECONNECT</button>
+        <hr>
+        <label>Bot Token Telegram:</label>
+        <input type="text" name="token" placeholder="123456:ABC-DEF1234...">
+        <label>Chat ID Telegram:</label>
+        <input type="text" name="chatid" placeholder="987654321">
+        <button type="submit" class="btn">LƯU WIFI & TELEGRAM</button>
       </form>
     </div>
-
     <div class="card">
-      <label><b>HTTP Proxy Server (Port 8080)</b></label>
       <form action="/save-proxy" method="POST">
-        <label>Proxy Forward IP:</label>
-        <input type="text" name="px_ip" placeholder="IP hoặc Domain">
-        <label>Proxy Port:</label>
-        <input type="number" name="px_port" placeholder="8080">
-        <button type="submit" class="btn btn-green">BẬT PROXY</button>
+        <label><b>Cấu hình Proxy Client:</b></label>
+        <label>IP Proxy Server:</label>
+        <input type="text" name="px_ip" placeholder="IP hoặc Domain" required>
+        <label>Port Proxy:</label>
+        <input type="number" name="px_port" placeholder="8080" required>
+        <label>Username (Nếu có):</label>
+        <input type="text" name="px_user" placeholder="Proxy User">
+        <label>Password (Nếu có):</label>
+        <input type="password" name="px_pass" placeholder="Proxy Password">
+        <button type="submit" class="btn btn-green">CHẠY PROXY</button>
       </form>
     </div>
-
     <div class="card">
       <label><b>Nạp Firmware (.bin mới)</b></label>
       <form method="POST" action="/update" enctype="multipart/form-data">
         <input type="file" name="update" accept=".bin" required>
-        <button type="submit" class="btn" style="background:#e11d48; margin-top:8px;">FLASH FIRMWARE</button>
+        <button type="submit" class="btn">FLASH FIRMWARE</button>
       </form>
     </div>
-
-    <div class="footer">
-      Project: <b>TunzAnhESP32 Kích Sóng</b><br>
-      Tác giả: <b>Tunz Anh Dev</b> | Zalo: <a href="https://zalo.me/0378389615" target="_blank">0378389615</a>
-    </div>
   </div>
-
-  <script>
-    function updateStats() {
-      fetch('/api/stats').then(r => r.json()).then(d => {
-        document.getElementById('ram').innerText = (d.free_heap / 1024).toFixed(1) + ' KB';
-        document.getElementById('sta').innerText = d.connected ? d.ip : 'Chưa kết nối';
-      });
-    }
-    setInterval(updateStats, 3000);
-    updateStats();
-  </script>
 </body>
 </html>
 )rawliteral";
 
 void setup() {
   Serial.begin(115200);
-  setCpuFrequencyMhz(240); // Ép xung 240MHz xử lý max tốc độ
+  setCpuFrequencyMhz(240);
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  pinMode(BTN_ENTER_PIN, INPUT_PULLUP);
-
-  Network.onEvent(onEvent);
+  WiFi.onEvent(onEvent);
 
   Wire.begin(21, 22);
-  Wire.setClock(400000); // 400kHz I2C Bus
+  Wire.setClock(400000);
   if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C) || display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
     oledOK = true;
+    displayMsg("TunzAnhESP32 KichSong", "  Dang khoi tao...", "  IP: 172.20.10.1", "  Dev: Tunz Anh Dev");
   }
-
-  displayMsg("SETUP AP MODE", "IP: 172.20.10.1", "Hay ket noi de cai da", "t");
 
   preferences.begin("hub-config", true);
   sta_ssid = preferences.getString("ssid", "");
   sta_pass = preferences.getString("pass", "");
   bot_token = preferences.getString("token", "");
   chat_id = preferences.getString("chatid", "");
+  proxy_ip = preferences.getString("px_ip", "");
+  proxy_port = preferences.getInt("px_port", 0);
+  proxy_user = preferences.getString("px_user", "");
+  proxy_pass = preferences.getString("px_pass", "");
+  proxy_enabled = preferences.getBool("px_en", false);
   preferences.end();
 
   WiFi.setAutoReconnect(true);
@@ -234,12 +213,12 @@ void setup() {
   WiFi.setSleep(WIFI_PS_NONE);
 
   WiFi.mode(WIFI_AP_STA);
-  WiFi.AP.begin();
-  WiFi.AP.config(ap_ip, ap_gateway, ap_mask, ap_leaseStart, ap_dns);
-  WiFi.AP.create(ap_ssid.c_str(), ap_pass.c_str());
+  WiFi.softAPConfig(ap_ip, ap_gateway, ap_mask);
+  WiFi.softAP(ap_ssid.c_str(), ap_pass.c_str());
 
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.start(53, "*", ap_ip);
+
   proxyServer.begin();
 
   if (sta_ssid != "") {
@@ -250,18 +229,8 @@ void setup() {
     botStarted = true;
   }
 
-  // --- WEB ROUTES ---
   server.on("/", []() { server.send_P(200, "text/html", admin_html); });
-  
-  // JSON API lấy thông số phần cứng real-time cho UI
-  server.on("/api/stats", []() {
-    String json = "{";
-    json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
-    json += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-    json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
-    json += "}";
-    server.send(200, "application/json", json);
-  });
+  server.on("/hotspot-detect.html", []() { server.send_P(200, "text/html", admin_html); });
 
   server.on("/save-wifi", HTTP_POST, []() {
     if (server.hasArg("ssid")) {
@@ -271,7 +240,22 @@ void setup() {
       preferences.putString("token", server.arg("token"));
       preferences.putString("chatid", server.arg("chatid"));
       preferences.end();
-      server.send(200, "text/html", "<h3>Da luu! ESP32 đang khoi dong lai...</h3>");
+      server.send(200, "text/html", "<h3>Da luu! ESP32 dang khoi dong lai...</h3>");
+      delay(1000);
+      ESP.restart();
+    }
+  });
+
+  server.on("/save-proxy", HTTP_POST, []() {
+    if (server.hasArg("px_ip") && server.hasArg("px_port")) {
+      preferences.begin("hub-config", false);
+      preferences.putString("px_ip", server.arg("px_ip"));
+      preferences.putInt("px_port", server.arg("px_port").toInt());
+      preferences.putString("px_user", server.arg("px_user"));
+      preferences.putString("px_pass", server.arg("px_pass"));
+      preferences.putBool("px_en", true);
+      preferences.end();
+      server.send(200, "text/html", "<h3>Da luu Proxy! Rebooting...</h3>");
       delay(1000);
       ESP.restart();
     }
@@ -300,18 +284,24 @@ void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
 
-  // BÓC NÚT ENTER SƠ ĐỒ NRFBOX DISPLAY QR CODE ZALO
-  if (digitalRead(BTN_ENTER_PIN) == LOW) {
-    showQRMode = !showQRMode;
-    if (showQRMode) {
-      drawZaloQR();
-    } else {
-      displayMsg("SETUP AP MODE", "IP: 172.20.10.1", "Hay ket noi de cai da", "t");
-    }
-    delay(300); // Chống nảy nút (Debounce)
+  // Bật/Tắt LED theo trạng thái kết nối
+  if (wifiConnectedEvent) {
+    wifiConnectedEvent = false;
+    digitalWrite(LED_PIN, HIGH);
   }
 
-  // Tự động Reconnect giữ sóng
+  if (wifiDisconnectedEvent) {
+    wifiDisconnectedEvent = false;
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  // CẬP NHẬT MÀN HÌNH OLED LIÊN TỤC MỖI 1 GIÂY
+  if (millis() - lastOLEDRefreshTime >= OLED_REFRESH_INTERVAL) {
+    lastOLEDRefreshTime = millis();
+    updateRealtimeOLED();
+  }
+
+  // Kiếm tra định kỳ kết nối Wi-Fi
   if (millis() - lastWifiCheckTime >= WIFI_CHECK_INTERVAL) {
     lastWifiCheckTime = millis();
     if (sta_ssid != "" && WiFi.status() != WL_CONNECTED) {
@@ -323,10 +313,10 @@ void loop() {
   // Telegram Cron
   if (botStarted && WiFi.status() == WL_CONNECTED && (millis() - lastCronTime >= CRON_INTERVAL)) {
     lastCronTime = millis();
-    String report = "⏰ **TUNZ ANH ESP32 REPORT**\n";
-    report += "📡 Wi-Fi: " + sta_ssid + "\n";
-    report += "🌐 IP: " + WiFi.localIP().toString() + "\n";
-    report += "🧠 Free RAM: " + String(ESP.getFreeHeap()) + " bytes\n";
+    String report = "⏰ **BÁO CÁO ĐỊNH KỲ (30 PHÚT)**\n";
+    report += "📡 TunzAnhESP32 Kích Sóng\n";
+    report += "🌐 Local IP: " + WiFi.localIP().toString() + "\n";
+    report += "🧠 RAM Trống: " + String(ESP.getFreeHeap()) + " bytes\n";
     sendTelegramMessage(report);
   }
 
@@ -335,9 +325,11 @@ void loop() {
 
 void sendTelegramMessage(String msg) {
   if (bot_token == "" || chat_id == "") return;
+
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(2);
+
   if (client.connect("api.telegram.org", 443)) {
     String payload = "{\"chat_id\":\"" + chat_id + "\",\"text\":\"" + msg + "\",\"parse_mode\":\"Markdown\"}";
     client.println("POST /bot" + bot_token + "/sendMessage HTTP/1.1");
@@ -348,6 +340,11 @@ void sendTelegramMessage(String msg) {
     client.println("Connection: close");
     client.println();
     client.println(payload);
+
+    unsigned long startWait = millis();
+    while (client.connected() && millis() - startWait < 1000) {
+      while (client.available()) { client.read(); }
+    }
     client.stop();
   }
 }
